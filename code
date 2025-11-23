@@ -1,0 +1,309 @@
+# teleconf_qa
+import re
+import json
+import math
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Optional sentiment (used to prioritize stressed / negative answers)
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    vader = SentimentIntensityAnalyzer()
+except Exception:
+    vader = None
+
+# -------------------------
+# Utilities: text cleaning + sentence tokenizer (no NLTK / spaCy)
+# -------------------------
+def clean_text(txt):
+    if not isinstance(txt, str):
+        return ""
+    txt = txt.strip()
+    txt = re.sub(r'\s+', ' ', txt)
+    return txt
+
+def sent_tokenize(text):
+    """Simple regex-based sentence splitter."""
+    s = clean_text(text)
+    if not s:
+        return []
+    sentences = re.split(r'(?<=[.!?])\s+', s)
+    return [ss.strip() for ss in sentences if ss.strip()]
+
+# -------------------------
+# Question detection
+# -------------------------
+QUESTION_PATTERNS = [
+    r'\?$',
+    r'^\s*(who|what|when|where|why|how|which|whom|whose)\b',
+    r'\bcan we\b', r'\bcan you\b', r'\bcould you\b', r'\bwould you\b',
+    r'\bdo we\b', r'\bis there\b', r'\bshould we\b', r'\bany idea\b'
+]
+QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), flags=re.IGNORECASE)
+
+def is_question(sentence):
+    sentence = sentence.strip()
+    if not sentence:
+        return False
+    if '?' in sentence:
+        return True
+    if QUESTION_RE.search(sentence):
+        return True
+    return False
+
+# -------------------------
+# Build sentence-level transcript
+# Input: DataFrame with columns: speaker, timestamp (optional), text
+# Output: DataFrame with one sentence per row and original metadata
+# -------------------------
+def transcript_to_sentences(df):
+    rows = []
+    for idx, r in df.iterrows():
+        speaker = r.get('speaker', 'Unknown')
+        ts = r.get('timestamp', None)
+        text = str(r.get('text',''))
+        sents = sent_tokenize(text)
+        for i, s in enumerate(sents):
+            rows.append({
+                'orig_row': idx,
+                'sent_index_in_row': i,
+                'speaker': speaker,
+                'timestamp': ts,
+                'sentence': s
+            })
+    return pd.DataFrame(rows)
+
+# -------------------------
+# Build TF-IDF on all sentences (for matching)
+# -------------------------
+def build_tfidf(sentences):
+    vec = TfidfVectorizer(stop_words='english', max_features=5000)
+    matrix = vec.fit_transform(sentences)
+    return vec, matrix
+
+# -------------------------
+# For each detected question, find best answering sentence(s)
+# Strategy:
+#  - Candidate answers = sentences that occur after the question within next N sentences (window)
+#  - Compute cosine similarity(question, candidate)
+#  - Return best candidate if score >= threshold, otherwise mark unanswered
+# -------------------------
+def find_answers(sent_df, window=10, score_threshold=0.12):
+    """
+    sent_df: dataframe sorted in chronological order (index order is chronological)
+    window: number of next sentences to consider as answers
+    score_threshold: minimum TF-IDF cosine similarity to accept an answer
+    """
+    results = []
+    sentences = sent_df['sentence'].tolist()
+    vec, matrix = build_tfidf(sentences)
+
+    for i, row in sent_df.iterrows():
+        sent = row['sentence']
+        if not is_question(sent):
+            continue
+
+        # question vector
+        q_vec = vec.transform([sent])
+
+        # candidate indices (next window sentences)
+        start = i + 1
+        end = min(i + 1 + window, len(sentences))
+        if start >= end:
+            # no candidates found
+            results.append({
+                'question_index': i,
+                'question': sent,
+                'question_speaker': row['speaker'],
+                'question_timestamp': row['timestamp'],
+                'answer_index': None,
+                'answer': None,
+                'answer_speaker': None,
+                'answer_timestamp': None,
+                'similarity': 0.0,
+                'status': 'unanswered'
+            })
+            continue
+
+        cand_matrix = matrix[start:end]
+        if cand_matrix.shape[0] == 0:
+            # no candidates
+            results.append({
+                'question_index': i,
+                'question': sent,
+                'question_speaker': row['speaker'],
+                'question_timestamp': row['timestamp'],
+                'answer_index': None,
+                'answer': None,
+                'answer_speaker': None,
+                'answer_timestamp': None,
+                'similarity': 0.0,
+                'status': 'unanswered'
+            })
+            continue
+
+        sims = cosine_similarity(q_vec, cand_matrix)[0]  # shape (window,)
+        best_idx_rel = int(np.argmax(sims))
+        best_score = float(sims[best_idx_rel])
+        best_idx = start + best_idx_rel
+        best_row = sent_df.iloc[best_idx]
+
+        status = 'answered' if best_score >= score_threshold else 'low_confidence'
+        if best_score < score_threshold:
+            # Consider searching whole transcript as fallback
+            full_sims = cosine_similarity(q_vec, matrix)[0]
+            overall_best_idx = int(np.argmax(full_sims))
+            overall_best_score = float(full_sims[overall_best_idx])
+            if overall_best_score >= score_threshold and overall_best_idx != i:
+                # accept global fallback
+                best_idx = overall_best_idx
+                best_score = overall_best_score
+                best_row = sent_df.iloc[best_idx]
+                status = 'answered_fallback'
+
+        results.append({
+            'question_index': i,
+            'question': sent,
+            'question_speaker': row['speaker'],
+            'question_timestamp': row['timestamp'],
+            'answer_index': best_idx if status != 'unanswered' else None,
+            'answer': best_row['sentence'] if status != 'unanswered' else None,
+            'answer_speaker': best_row['speaker'] if status != 'unanswered' else None,
+            'answer_timestamp': best_row['timestamp'] if status != 'unanswered' else None,
+            'similarity': round(best_score, 4),
+            'status': status
+        })
+
+    return pd.DataFrame(results)
+
+# -------------------------
+# Prioritize questions (heuristics)
+# - unanswered higher priority
+# - questions asked by customers/external speakers (if labeled) higher priority
+# - negative sentiment on question (if vader available)
+# - frequency of topic terms in meeting (TF-IDF)
+# -------------------------
+def prioritize_questions(qdf, sent_df, top_k=10):
+    qdf = qdf.copy()
+    # base score
+    qdf['priority'] = 0.0
+    qdf.loc[qdf['status']=='unanswered', 'priority'] += 2.0
+    qdf.loc[qdf['status']=='low_confidence', 'priority'] += 1.0
+    # speaker weight: if speaker name contains 'client' or 'customer' (simple heuristic)
+    qdf['speaker_flag'] = qdf['question_speaker'].str.lower().str.contains('client|customer|guest').fillna(False)
+    qdf.loc[qdf['speaker_flag'], 'priority'] += 1.5
+
+    # sentiment on question
+    if vader is not None:
+        qdf['sentiment'] = qdf['question'].apply(lambda t: vader.polarity_scores(t)['compound'])
+        # negative questions higher priority
+        qdf.loc[qdf['sentiment'] < -0.2, 'priority'] += 1.0
+    else:
+        qdf['sentiment'] = 0.0
+
+    # length based (longer = maybe complex => higher)
+    qdf['q_len'] = qdf['question'].apply(lambda t: len(t.split()))
+    qdf['priority'] += (qdf['q_len'] / 50.0)  # normalized small boost
+
+    qdf = qdf.sort_values(['priority', 'similarity'], ascending=[False, False])
+    return qdf.reset_index(drop=True).head(top_k)
+
+# -------------------------
+# Summary function to produce human-friendly report and files
+# -------------------------
+def qa_pipeline(transcript_df, window=10, score_threshold=0.12, out_prefix='teleconf_qa'):
+    """
+    transcript_df: DataFrame with columns: speaker, text, timestamp (optional)
+    """
+    sent_df = transcript_to_sentences(transcript_df).reset_index(drop=True)
+
+    if sent_df.empty:
+        print("No sentences found in transcript.")
+        return {}
+
+    q_results = find_answers(sent_df, window=window, score_threshold=score_threshold)
+
+    # unanswered detection
+    unanswered = q_results[q_results['status']=='unanswered'].copy()
+    low_conf = q_results[q_results['status']=='low_confidence'].copy()
+
+    # prioritize
+    prioritized = prioritize_questions(q_results, sent_df, top_k=50)
+
+    # produce summary JSON
+    report = {
+        'num_sentences': len(sent_df),
+        'num_questions': len(q_results),
+        'num_unanswered': len(unanswered),
+        'num_low_confidence': len(low_conf),
+        'top_priority_questions': prioritized.to_dict(orient='records')
+    }
+
+    # Save CSVs
+    q_results.to_csv(f'{out_prefix}_qa_pairs.csv', index=False)
+    unanswered.to_csv(f'{out_prefix}_unanswered.csv', index=False)
+    prioritized.to_csv(f'{out_prefix}_prioritized_questions.csv', index=False)
+
+    with open(f'{out_prefix}_report.json', 'w', encoding='utf-8') as fh:
+        json.dump(report, fh, indent=2)
+
+    # Terminal friendly printing
+    print("\n==== TELECONFERENCE Q/A REPORT ====")
+    print(f"Total sentences: {report['num_sentences']}")
+    print(f"Detected questions: {report['num_questions']}")
+    print(f"Unanswered questions: {report['num_unanswered']}")
+    print(f"Low-confidence answers: {report['num_low_confidence']}\n")
+
+    print("---- Top priority questions ----")
+    for i, row in prioritized.head(10).iterrows():
+        print(f"{i+1}. Q: {row['question']} (speaker: {row['question_speaker']})")
+        print(f"    status: {row['status']}, sim: {row['similarity']}, priority: {row['priority']:.2f}")
+        if pd.notna(row.get('answer')):
+            print(f"    A: {row.get('answer')} (speaker: {row.get('answer_speaker')})")
+        else:
+            print("    A: (none)")
+        print()
+
+    print("Files saved:")
+    print(f"- {out_prefix}_qa_pairs.csv")
+    print(f"- {out_prefix}_unanswered.csv")
+    print(f"- {out_prefix}_prioritized_questions.csv")
+    print(f"- {out_prefix}_report.json")
+
+    return {
+        'sentences': sent_df,
+        'qa_pairs': q_results,
+        'unanswered': unanswered,
+        'prioritized': prioritized,
+        'report': report
+    }
+
+# -------------------------
+# Helper: convert a simple chat-style transcript dict into DataFrame (example)
+# -------------------------
+def make_sample_transcript():
+    data = [
+        {'speaker':'Host', 'timestamp':'00:00:05', 'text': 'Welcome everybody. We will cover Q1 metrics then take questions.'},
+        {'speaker':'Presenter', 'timestamp':'00:01:20', 'text': 'Revenue grew by 12% quarter over quarter. Our churn decreased.'},
+        {'speaker':'Client-John', 'timestamp':'00:02:10', 'text': 'Who will be responsible for the new rollout?'},
+        {'speaker':'Presenter', 'timestamp':'00:02:45', 'text': 'The rollout will be handled by the product team, and Sarah will lead the deployment.'},
+        {'speaker':'Client-Amy', 'timestamp':'00:03:10', 'text': 'Can you share the expected timeline?'},
+        {'speaker':'Presenter', 'timestamp':'00:03:30', 'text': 'We expect a phased rollout starting next month and completing by end of quarter.'},
+        {'speaker':'Client-John', 'timestamp':'00:04:00', 'text': 'What about integration with the CRM?'},
+        {'speaker':'TechLead', 'timestamp':'00:04:30', 'text': 'Integration is planned but we need API keys and coordination from your side.'},
+        {'speaker':'Client-Amy', 'timestamp':'00:05:00', 'text': 'Will there be a cost increase?'},
+        {'speaker':'Presenter', 'timestamp':'00:05:20', 'text': 'No immediate cost increase expected; any premium features will be optional.'},
+        {'speaker':'Client-Amy', 'timestamp':'00:05:50', 'text': 'Thank you.'},
+        {'speaker':'Host', 'timestamp':'00:06:00', 'text': 'Any other questions?'},
+    ]
+    return pd.DataFrame(data)
+
+# -------------------------
+# Example run (uncomment to execute in notebook)
+# -------------------------
+if __name__ == "__main__":
+    df = make_sample_transcript()
+    outs = qa_pipeline(df, window=6, score_threshold=0.12, out_prefix='teleconf_qa_example')
