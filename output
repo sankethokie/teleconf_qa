@@ -1,0 +1,29 @@
+==== TELECONFERENCE Q/A REPORT ====
+Total sentences: 14
+Detected questions: 5
+Unanswered questions: 1
+Low-confidence answers: 0
+
+---- Top priority questions ----
+1. Q: Any other questions? (speaker: Host)
+    status: unanswered, sim: 0.0, priority: 2.06
+    A: (none)
+
+2. Q: Who will be responsible for the new rollout? (speaker: Client-John)
+    status: answered, sim: 0.1434, priority: 1.66
+    A: The rollout will be handled by the product team, and Sarah will lead the deployment. (speaker: Presenter)
+
+3. Q: Will there be a cost increase? (speaker: Client-Amy)
+    status: answered, sim: 0.4897, priority: 1.62
+    A: No immediate cost increase expected; any premium features will be optional. (speaker: Presenter)
+
+4. Q: What about integration with the CRM? (speaker: Client-John)
+    status: answered, sim: 0.2362, priority: 1.62
+    A: Integration is planned but we need API keys and coordination from your side. (speaker: TechLead)
+
+5. Q: Can you share the expected timeline? (speaker: Client-Amy)
+...
+- teleconf_qa_example_qa_pairs.csv
+- teleconf_qa_example_unanswered.csv
+- teleconf_qa_example_prioritized_questions.csv
+- teleconf_qa_example_report.json
